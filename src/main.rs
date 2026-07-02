@@ -5,6 +5,8 @@
 //! relay EOA is replaced by multisig execution; this binary stays single-key for local signing.
 
 mod screening;
+mod perc20_approve;
+mod perc20_atomic_swap;
 
 use anyhow::{anyhow, Context, Result};
 use axum::{extract::{Query, State}, http::StatusCode, routing::get, routing::post, Json, Router};
@@ -640,6 +642,14 @@ fn build_router(state: Arc<RelayerHttpConfig>) -> Router {
         .route("/swap/accept", post(http_swap_accept))
         .route("/swap/requests", get(http_swap_requests))
         .route("/swap/order", get(http_swap_order))
+        // ── dex_user.html endpoints (rebuilt): pERC20 mint/approve/balanceOf/transfer + PERC20AtomicSwap ──
+        .route("/erc/mint/build_submit", post(http_erc_mint_build_submit))
+        .route("/erc/approve/submit", post(http_erc_approve_submit))
+        .route("/erc/balanceOf/submit", post(http_erc_approve_submit))
+        .route("/erc/transfer/submit", post(http_erc_transfer_submit))
+        .route("/perc20/swap/initiate", post(http_perc20_swap_initiate))
+        .route("/perc20/swap/join", post(http_perc20_swap_join))
+        .route("/perc20/swap/complete", post(http_perc20_swap_complete))
         .layer(build_cors_layer())
         .with_state(state)
 }
@@ -3403,6 +3413,233 @@ fn rlp_list(items: Vec<Vec<u8>>) -> Vec<u8> {
         out
     }
 }
+
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  dex_user.html endpoints (rebuilt after a git-abort dropped them from main.rs).
+//  Custody-free: the relayer only assembles calldata from already-proved fixtures /
+//  bundles and pays gas. Encoders live in perc20_approve.rs / perc20_atomic_swap.rs
+//  (intact); this just wires them to HTTP routes.
+// ══════════════════════════════════════════════════════════════════════════════
+
+/// Poll a tx receipt (~36s) so we can read its logs (e.g. SwapInitiated -> swapId).
+async fn poll_tx_receipt(rpc_url: &str, tx_hash: &str) -> Option<Value> {
+    let client = Client::new();
+    for _ in 0..60 {
+        if let Ok(resp) = client
+            .post(rpc_url)
+            .json(&serde_json::json!({"jsonrpc":"2.0","id":1,"method":"eth_getTransactionReceipt","params":[tx_hash]}))
+            .send()
+            .await
+        {
+            if let Ok(v) = resp.json::<Value>().await {
+                if let Some(r) = v.get("result") {
+                    if !r.is_null() { return Some(r.clone()); }
+                }
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+    }
+    None
+}
+
+// ── pERC20 mint: build calldata from a /mint/prove fixture, then submit ──
+#[derive(Debug, Deserialize)]
+struct HttpErcMintBuildSubmitRequest {
+    contract: String,
+    amount: u64,
+    fixture: Value,
+    #[serde(default)]
+    gas_limit: Option<u64>,
+}
+async fn http_erc_mint_build_submit(
+    State(cfg): State<Arc<RelayerHttpConfig>>,
+    Json(req): Json<HttpErcMintBuildSubmitRequest>,
+) -> Result<Json<HttpTxResponse>, (StatusCode, Json<HttpErrorResponse>)> {
+    async {
+        // mint() is onlyIssuer — sign with the issuer key, NOT the relayer's submitter key
+        // (otherwise the pool reverts with NotIssuer()). Matches http_erc_mint_submit + mint_demo_note.
+        let issuer_key = cfg.issuer_private_key.as_deref().ok_or_else(|| {
+            anyhow!("mint disabled: set PERC20_ISSUER_PRIVATE_KEY on the relayer (mint is onlyIssuer)")
+        })?;
+        let pool = perc20_approve::parse_pool_addr(&req.contract).map_err(|e| anyhow!(e))?;
+        let calldata = perc20_approve::build_mint_calldata(cfg.chain_id, pool, req.amount, &req.fixture);
+        // The issuer sender differs from the relayer's submitter key, so it syncs its own nonce.
+        let nonce_cache = Arc::new(Mutex::new(None));
+        let tx_hash = send_raw_calldata(
+            &cfg.rpc_url, cfg.chain_id, issuer_key, &req.contract,
+            calldata, 0, cfg.gas_price_gwei, req.gas_limit.unwrap_or(28_000_000), &nonce_cache,
+        ).await?;
+        tokio::spawn(notify_pending_tx(cfg.indexer_url.clone(), tx_hash.clone(), req.contract.clone()));
+        Ok::<_, anyhow::Error>(HttpTxResponse { tx_hash })
+    }.await.map(Json).map_err(http_error)
+}
+
+// ── pERC20 approve / balanceOf: value-neutral funding(+change)+delivery transfer bundle ──
+#[derive(Debug, Deserialize)]
+struct HttpErcApproveSubmitRequest {
+    contract: String,
+    funding: Value,
+    delivery: Value,
+    #[serde(default)]
+    change: Option<Value>,
+    #[serde(default)]
+    gas_limit: Option<u64>,
+}
+async fn http_erc_approve_submit(
+    State(cfg): State<Arc<RelayerHttpConfig>>,
+    Json(req): Json<HttpErcApproveSubmitRequest>,
+) -> Result<Json<HttpTxResponse>, (StatusCode, Json<HttpErrorResponse>)> {
+    async {
+        let pool = perc20_approve::parse_pool_addr(&req.contract).map_err(|e| anyhow!(e))?;
+        // Action order: funding (A), optional change (C), delivery (B). One combined binding sig.
+        let mut fixtures: Vec<&Value> = vec![&req.funding];
+        if let Some(c) = req.change.as_ref() { fixtures.push(c); }
+        fixtures.push(&req.delivery);
+        let calldata = perc20_approve::build_approve_transfer_calldata(cfg.chain_id, pool, &fixtures);
+        let tx_hash = send_raw_calldata(
+            &cfg.rpc_url, cfg.chain_id, &cfg.private_key, &req.contract,
+            calldata, 0, cfg.gas_price_gwei, req.gas_limit.unwrap_or(28_000_000), &cfg.nonce_cache,
+        ).await?;
+        tokio::spawn(notify_pending_tx(cfg.indexer_url.clone(), tx_hash.clone(), req.contract.clone()));
+        Ok::<_, anyhow::Error>(HttpTxResponse { tx_hash })
+    }.await.map(Json).map_err(http_error)
+}
+
+// ── pERC20 transfer: 1 action (+ optional change) -> transfer(PrivacyCall) ──
+#[derive(Debug, Deserialize)]
+struct HttpErcTransferSubmitRequest {
+    contract: String,
+    fixture: Value,
+    #[serde(default)]
+    change: Option<Value>,
+    #[serde(default)]
+    gas_limit: Option<u64>,
+}
+async fn http_erc_transfer_submit(
+    State(cfg): State<Arc<RelayerHttpConfig>>,
+    Json(req): Json<HttpErcTransferSubmitRequest>,
+) -> Result<Json<HttpTxResponse>, (StatusCode, Json<HttpErrorResponse>)> {
+    async {
+        let pool = perc20_approve::parse_pool_addr(&req.contract).map_err(|e| anyhow!(e))?;
+        let mut fixtures: Vec<&Value> = vec![&req.fixture];
+        if let Some(c) = req.change.as_ref() { fixtures.push(c); }
+        let calldata = perc20_approve::build_approve_transfer_calldata(cfg.chain_id, pool, &fixtures);
+        let tx_hash = send_raw_calldata(
+            &cfg.rpc_url, cfg.chain_id, &cfg.private_key, &req.contract,
+            calldata, 0, cfg.gas_price_gwei, req.gas_limit.unwrap_or(28_000_000), &cfg.nonce_cache,
+        ).await?;
+        tokio::spawn(notify_pending_tx(cfg.indexer_url.clone(), tx_hash.clone(), req.contract.clone()));
+        Ok::<_, anyhow::Error>(HttpTxResponse { tx_hash })
+    }.await.map(Json).map_err(http_error)
+}
+
+// ── PERC20AtomicSwap: initiate (maker) -> join (taker) -> complete (maker reveals S) ──
+#[derive(Debug, Deserialize)]
+struct Perc20SwapInitiateRequest {
+    #[serde(default)]
+    coordinator: Option<String>,
+    pool_a: String,
+    pool_b: String,
+    bundle_a: OrchardStoredBundle,
+    htlc_hash_hex: String,
+    counterparty_addr_hex: String,
+    #[serde(default)]
+    gas_limit: Option<u64>,
+}
+#[derive(serde::Serialize)]
+struct Perc20SwapInitiateResponse {
+    tx_hash: String,
+    swap_id: String,
+}
+async fn http_perc20_swap_initiate(
+    State(cfg): State<Arc<RelayerHttpConfig>>,
+    Json(req): Json<Perc20SwapInitiateRequest>,
+) -> Result<Json<Perc20SwapInitiateResponse>, (StatusCode, Json<HttpErrorResponse>)> {
+    async {
+        let coordinator = resolve_coordinator(&cfg, &req.coordinator)?;
+        let coord20 = parse_evm_address_hex(&coordinator).map_err(|e| anyhow!("bad coordinator: {e}"))?;
+        let pool_a = parse_evm_address_hex(&req.pool_a).map_err(|e| anyhow!("bad pool_a: {e}"))?;
+        let pool_b = parse_evm_address_hex(&req.pool_b).map_err(|e| anyhow!("bad pool_b: {e}"))?;
+        let htlc_hash = parse_hex32(&req.htlc_hash_hex).context("htlc_hash_hex")?;
+        let counterparty = hex::decode(strip_0x(&req.counterparty_addr_hex)).context("counterparty_addr_hex")?;
+        let actions = bundle_to_action_args(&req.bundle_a)?;
+        let binding = bundle_binding_sig(&req.bundle_a)?;
+        let calldata = perc20_atomic_swap::encode_initiate(&pool_a, &pool_b, &actions, &binding, &htlc_hash, &counterparty);
+        let tx_hash = send_raw_calldata(
+            &cfg.rpc_url, cfg.chain_id, &cfg.private_key, &coordinator,
+            calldata, 0, cfg.gas_price_gwei, req.gas_limit.unwrap_or(cfg.gas_limit_swap), &cfg.nonce_cache,
+        ).await?;
+        // swapId = keccak(poolA,poolB,sender,nonce) is not derivable client-side; read it from the
+        // SwapInitiated event (the frontend also falls back to scanning the event by htlcHash).
+        let swap_id = match poll_tx_receipt(&cfg.rpc_url, &tx_hash).await {
+            Some(rc) => perc20_atomic_swap::extract_swap_id(&rc, &coord20)
+                .map(|id| format!("0x{}", hex::encode(id))).unwrap_or_default(),
+            None => String::new(),
+        };
+        tokio::spawn(notify_pending_tx(cfg.indexer_url.clone(), tx_hash.clone(), coordinator.clone()));
+        println!("[perc20/swap/initiate] tx={tx_hash} swap_id={swap_id}");
+        Ok::<_, anyhow::Error>(Perc20SwapInitiateResponse { tx_hash, swap_id })
+    }.await.map(Json).map_err(http_error)
+}
+
+#[derive(Debug, Deserialize)]
+struct Perc20SwapJoinRequest {
+    #[serde(default)]
+    coordinator: Option<String>,
+    swap_id_hex: String,
+    bundle_b: OrchardStoredBundle,
+    htlc_hash_hex: String,
+    #[serde(default)]
+    gas_limit: Option<u64>,
+}
+async fn http_perc20_swap_join(
+    State(cfg): State<Arc<RelayerHttpConfig>>,
+    Json(req): Json<Perc20SwapJoinRequest>,
+) -> Result<Json<HttpTxResponse>, (StatusCode, Json<HttpErrorResponse>)> {
+    async {
+        let coordinator = resolve_coordinator(&cfg, &req.coordinator)?;
+        let swap_id = parse_hex32(&req.swap_id_hex).context("swap_id_hex")?;
+        let htlc_hash = parse_hex32(&req.htlc_hash_hex).context("htlc_hash_hex")?;
+        let actions = bundle_to_action_args(&req.bundle_b)?;
+        let binding = bundle_binding_sig(&req.bundle_b)?;
+        let calldata = perc20_atomic_swap::encode_join(&swap_id, &actions, &binding, &htlc_hash);
+        let tx_hash = send_raw_calldata(
+            &cfg.rpc_url, cfg.chain_id, &cfg.private_key, &coordinator,
+            calldata, 0, cfg.gas_price_gwei, req.gas_limit.unwrap_or(cfg.gas_limit_swap), &cfg.nonce_cache,
+        ).await?;
+        tokio::spawn(notify_pending_tx(cfg.indexer_url.clone(), tx_hash.clone(), coordinator.clone()));
+        Ok::<_, anyhow::Error>(HttpTxResponse { tx_hash })
+    }.await.map(Json).map_err(http_error)
+}
+
+#[derive(Debug, Deserialize)]
+struct Perc20SwapCompleteRequest {
+    #[serde(default)]
+    coordinator: Option<String>,
+    swap_id_hex: String,
+    secret_hex: String,
+    #[serde(default)]
+    gas_limit: Option<u64>,
+}
+async fn http_perc20_swap_complete(
+    State(cfg): State<Arc<RelayerHttpConfig>>,
+    Json(req): Json<Perc20SwapCompleteRequest>,
+) -> Result<Json<HttpTxResponse>, (StatusCode, Json<HttpErrorResponse>)> {
+    async {
+        let coordinator = resolve_coordinator(&cfg, &req.coordinator)?;
+        let swap_id = parse_hex32(&req.swap_id_hex).context("swap_id_hex")?;
+        let preimage = parse_hex32(&req.secret_hex).context("secret_hex")?;
+        let calldata = perc20_atomic_swap::encode_complete(&swap_id, &preimage);
+        let tx_hash = send_raw_calldata(
+            &cfg.rpc_url, cfg.chain_id, &cfg.private_key, &coordinator,
+            calldata, 0, cfg.gas_price_gwei, req.gas_limit.unwrap_or(cfg.gas_limit_swap), &cfg.nonce_cache,
+        ).await?;
+        tokio::spawn(notify_pending_tx(cfg.indexer_url.clone(), tx_hash.clone(), coordinator.clone()));
+        Ok::<_, anyhow::Error>(HttpTxResponse { tx_hash })
+    }.await.map(Json).map_err(http_error)
+}
+
 
 #[cfg(test)]
 mod tests {

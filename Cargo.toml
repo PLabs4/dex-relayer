@@ -17,6 +17,11 @@ clap = { version = "4", features = ["derive", "env"] }
 dotenvy = "0.15"
 glob = "0.3"
 hex = "0.4"
+# Used by the rebuilt pERC20 calldata encoders (perc20_approve.rs / perc20_atomic_swap.rs).
+ethabi = "18"
+num-bigint = "0.4"
+num-traits = "0.2"
+rand = "0.8"
 k256 = { version = "0.13", features = ["ecdsa"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "native-tls"] }
 serde = { version = "1", features = ["derive"] }
